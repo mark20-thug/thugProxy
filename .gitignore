@@ -1,0 +1,9 @@
+# Personal / runtime data (each user keeps their own list)
+proxy-pool.txt
+proxy-chain.txt
+vpn-auth.txt
+*.ovpn
+
+# Python
+__pycache__/
+*.pyc

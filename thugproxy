@@ -1,0 +1,807 @@
+#!/usr/bin/env python3
+"""thugproxy - OpenVPN over a chain of fast, verified proxies."""
+
+import argparse
+import glob
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+
+__version__ = "1.0.0"
+
+# --- Configuration ---------------------------------------------------------
+
+# Data directory: proxy lists, auth file, and (by default) OpenVPN configs.
+# Override with:  export THUGPROXY_HOME=/path/to/dir
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+HOME = os.path.expanduser(os.environ.get("THUGPROXY_HOME", SCRIPT_DIR))
+
+# Directory containing .ovpn files (defaults to THUGPROXY_HOME)
+OVPN_DIR = os.path.expanduser(os.environ.get("THUGPROXY_OVPN_DIR", HOME))
+
+AUTH_FILE = os.path.join(HOME, "vpn-auth.txt")
+PROXY_CHAIN_FILE = os.path.join(HOME, "proxy-chain.txt")
+PROXY_POOL_FILE = os.path.join(HOME, "proxy-pool.txt")
+PROXYCHAINS_CONF = os.environ.get("PROXYCHAINS_CONF", "/etc/proxychains.conf")
+
+# Seconds between live public IP checks while the tunnel is active
+LIVE_IP_INTERVAL = 5
+
+# Number of proxies in the auto-built replacement chain
+MAX_CHAIN_HOPS = 2
+
+# Proxy health-check settings
+PROXY_TEST_URL = "https://example.com/"
+PROXY_TEST_TIMEOUT = 6
+PROXY_TEST_WORKERS = 20
+
+# How long to wait for the VPN tunnel to come up before rotating the chain
+VPN_READY_TIMEOUT = 45
+
+# Consecutive failed connection checks before the chain is considered dead
+MAX_POLL_FAILURES = 3
+
+# Timeout for validating a whole proxy chain through ProxyChains
+CHAIN_TEST_TIMEOUT = 30
+
+PROXY_TYPES = ("socks4", "socks5", "http", "https")
+
+
+def ensure_home():
+    os.makedirs(HOME, exist_ok=True)
+
+
+def get_ip_info():
+    """Fetches public IP, city, country, and ISP from ipinfo.io."""
+    try:
+        req = urllib.request.Request(
+            "https://ipinfo.io",
+            headers={"User-Agent": "curl/7.88.1"},
+        )
+        with urllib.request.urlopen(req, timeout=8) as response:
+            data = json.loads(response.read().decode())
+            return {
+                "ip": data.get("ip", "Unknown"),
+                "city": data.get("city", "Unknown"),
+                "country": data.get("country", "Unknown"),
+                "org": data.get("org", "Unknown"),
+            }
+    except Exception as e:
+        return {"ip": f"Error ({e})", "city": "-", "country": "-", "org": "-"}
+
+
+def ip_ok(info):
+    return not str(info.get("ip", "Error")).startswith("Error")
+
+
+def ensure_auth_file():
+    """Creates the default VPN Gate credentials file if missing."""
+    ensure_home()
+    if not os.path.exists(AUTH_FILE):
+        with open(AUTH_FILE, "w") as f:
+            f.write("vpn\nvpn\n")
+        os.chmod(AUTH_FILE, 0o600)
+
+
+def select_ovpn_file():
+    """Finds .ovpn files in OVPN_DIR and lets you pick one if multiple exist."""
+    files = sorted(glob.glob(os.path.join(OVPN_DIR, "*.ovpn")))
+    if not files:
+        print(f"[!] No .ovpn files found in {OVPN_DIR}")
+        print("    Put a .ovpn file there, or set THUGPROXY_OVPN_DIR.")
+        sys.exit(1)
+
+    if len(files) == 1:
+        return files[0]
+
+    print("\nAvailable VPN Configurations:")
+    for idx, f in enumerate(files, 1):
+        print(f"  [{idx}] {os.path.basename(f)}")
+
+    while True:
+        choice = input("\nSelect a server number: ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(files):
+            return files[int(choice) - 1]
+        print("Invalid choice. Try again.")
+
+
+def parse_proxy_line(line):
+    """Parses one proxy entry, optionally annotated with a "# CC" country."""
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+
+    cc_match = re.search(r"#\s*([A-Za-z]{2})\b", line)
+    country = cc_match.group(1).upper() if cc_match else "??"
+
+    raw = line.split("#", 1)[0].strip()
+    if not raw:
+        return None
+
+    url_match = re.match(r"^(socks4|socks5|http|https)://([^:\s]+):(\d+)$", raw)
+    if url_match:
+        ptype, host, port = url_match.group(1), url_match.group(2), int(url_match.group(3))
+    else:
+        parts = raw.split()
+        if len(parts) != 3 or not parts[2].isdigit():
+            return None
+        ptype, host, port = parts[0].lower(), parts[1], int(parts[2])
+
+    if ptype not in PROXY_TYPES:
+        return None
+    return (ptype, host, port, country)
+
+
+def parse_proxy_arg(raw, default_type="socks5"):
+    """Parses a CLI proxy argument: type://host:port, 'type host port',
+    or bare host:port (uses default_type)."""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    entry = parse_proxy_line(raw)
+    if entry:
+        return entry
+    m = re.match(
+        r"^(?:(socks4|socks5|http|https)://)?([^:\s]+):(\d+)$", raw, re.IGNORECASE
+    )
+    if m:
+        ptype = (m.group(1) or default_type).lower()
+        if ptype not in PROXY_TYPES:
+            return None
+        return (ptype, m.group(2), int(m.group(3)), "??")
+    return None
+
+
+def fmt_proxy(entry):
+    ptype, host, port, country = entry
+    return f"{ptype}://{host}:{port}  ({country})"
+
+
+def proxy_key(entry):
+    return f"{entry[0]}://{entry[1]}:{entry[2]}"
+
+
+def load_entries(path):
+    entries = []
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            for line in f:
+                entry = parse_proxy_line(line)
+                if entry:
+                    entries.append(entry)
+    return entries
+
+
+def load_proxy_chain():
+    return [(p, h, pt) for p, h, pt, _ in load_entries(PROXY_CHAIN_FILE)]
+
+
+def load_proxy_pool():
+    pool = load_entries(PROXY_POOL_FILE)
+    if not pool:
+        pool = load_entries(PROXY_CHAIN_FILE)
+    return pool
+
+
+def save_chain_file(chain):
+    try:
+        with open(PROXY_CHAIN_FILE, "w") as f:
+            for ptype, host, port in chain:
+                f.write(f"{ptype}://{host}:{port}\n")
+    except OSError as e:
+        print(f"[!] Could not save the proxy chain file: {e}")
+
+
+def write_proxychains_config(proxies):
+    """Writes the proxy chain into the ProxyChains config.
+
+    strict_chain is required: dynamic_chain falls back to a direct (unproxied)
+    connection when every proxy is down, which would leak the real IP. DNS is
+    resolved locally because free proxies usually refuse port 53.
+    """
+    with open(PROXYCHAINS_CONF, "w") as f:
+        f.write("strict_chain\n")
+        f.write("tcp_read_time_out 15000\n")
+        f.write("tcp_connect_time_out 10000\n")
+        f.write("\n[ProxyList]\n")
+        for ptype, host, port in proxies:
+            f.write(f"{ptype}\t{host}\t{port}\n")
+        f.write("\n")
+
+
+def vpn_route_active():
+    """True if the default route currently goes through a tun/tap device."""
+    ip_bin = shutil.which("ip")
+    if not ip_bin:
+        return None
+    try:
+        result = subprocess.run(
+            [ip_bin, "route", "get", "1.1.1.1"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        out = result.stdout
+        return (" tun" in out) or (" tap" in out)
+    except Exception:
+        return None
+
+
+def test_proxy(proxy, timeout=None):
+    """Returns the latency of a working proxy, or None if it is unusable."""
+    curl = shutil.which("curl")
+    timeout = timeout or PROXY_TEST_TIMEOUT
+    ptype, host, port = proxy[0], proxy[1], proxy[2]
+    if not curl:
+        return 0.0
+
+    if ptype == "socks5":
+        route = ["--socks5", f"{host}:{port}"]
+    elif ptype == "socks4":
+        route = ["--socks4", f"{host}:{port}"]
+    else:
+        route = ["-x", f"http://{host}:{port}"]
+
+    try:
+        result = subprocess.run(
+            [
+                curl,
+                "-s",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code} %{time_total}",
+                "--max-time",
+                str(timeout),
+                *route,
+                PROXY_TEST_URL,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout + 3,
+        )
+        parts = result.stdout.split()
+        if len(parts) == 2 and parts[0][:1] in ("2", "3"):
+            return float(parts[1])
+    except Exception:
+        pass
+    return None
+
+
+def test_proxies(proxies, timeout=None):
+    """Tests proxies in parallel. Returns [(proxy, latency_or_None), ...]."""
+    if not proxies:
+        return []
+    if not shutil.which("curl"):
+        print("[!] curl not found; skipping reachability checks.")
+        return [(p, 0.0) for p in proxies]
+    with ThreadPoolExecutor(max_workers=PROXY_TEST_WORKERS) as executor:
+        results = list(
+            executor.map(lambda p: (p, test_proxy(p, timeout)), proxies)
+        )
+    return results
+
+
+def pick_chain(pool, avoid=None):
+    """Builds the fastest working chain, preferring distinct countries.
+
+    Non-final hops are restricted to SOCKS proxies because HTTP proxies
+    commonly refuse CONNECT to a downstream proxy port.
+    """
+    avoid = set(avoid or ())
+    candidates = [p for p in pool if p[1] not in avoid]
+    if not candidates:
+        return None
+
+    if shutil.which("curl"):
+        results = test_proxies(candidates)
+        ranked = sorted(
+            (p for p, latency in results if latency is not None),
+            key=lambda p: [lat for q, lat in results if q == p][0],
+        )
+    else:
+        ranked = candidates
+    if not ranked:
+        return None
+
+    chain = []
+    used_countries = set()
+
+    def take(predicate):
+        for entry in ranked:
+            if entry in chain:
+                continue
+            country = entry[3]
+            if country != "??" and country in used_countries:
+                continue
+            if not predicate(entry):
+                continue
+            chain.append(entry)
+            used_countries.add(country)
+            return True
+        return False
+
+    while len(chain) < MAX_CHAIN_HOPS - 1:
+        if not take(lambda p: p[0] in ("socks4", "socks5")):
+            if not take(lambda p: True):
+                break
+
+    while len(chain) < MAX_CHAIN_HOPS:
+        if not take(lambda p: True):
+            break
+
+    while len(chain) < MAX_CHAIN_HOPS:
+        for entry in ranked:
+            if entry not in chain:
+                chain.append(entry)
+                break
+        else:
+            break
+
+    return [(p[0], p[1], p[2]) for p in chain] or None
+
+
+def chain_works(proxies):
+    """Validates the whole chain through ProxyChains end to end."""
+    if not proxies:
+        return True
+    if not shutil.which("proxychains") or not shutil.which("curl"):
+        return True
+
+    write_proxychains_config(proxies)
+    try:
+        result = subprocess.run(
+            [
+                "proxychains",
+                "curl",
+                "-s",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "--max-time",
+                str(CHAIN_TEST_TIMEOUT),
+                PROXY_TEST_URL,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=CHAIN_TEST_TIMEOUT + 10,
+        )
+        lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+        return bool(lines) and lines[-1][:1] in ("2", "3")
+    except Exception:
+        return False
+
+
+def find_working_chain(pool, dead_chain):
+    """Keeps trying new proxy combinations until one passes validation."""
+    avoid = {host for _, host, _ in dead_chain}
+    total_hosts = len({p[1] for p in pool})
+
+    while True:
+        candidate = pick_chain(pool, avoid=avoid)
+        if candidate is None:
+            return None
+        if chain_works(candidate):
+            return candidate
+        print("[!] Selected chain failed validation; trying other proxies...")
+        avoid |= {host for _, host, _ in candidate}
+        if len(avoid) >= total_hosts:
+            return None
+
+
+def start_vpn(ovpn_file, proxies):
+    """Starts OpenVPN, routing through the proxy chain when one is configured."""
+    if not proxies:
+        cmd = [
+            "openvpn",
+            "--config",
+            ovpn_file,
+            "--auth-user-pass",
+            AUTH_FILE,
+        ]
+    else:
+        write_proxychains_config(proxies)
+        cmd = [
+            "proxychains",
+            "openvpn",
+            "--config",
+            ovpn_file,
+            "--auth-user-pass",
+            AUTH_FILE,
+            "--proto",
+            "tcp",
+        ]
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    proc.log_tail = deque(maxlen=100)
+    proc.fatal = False
+
+    def read_logs():
+        try:
+            for line in proc.stdout:
+                proc.log_tail.append(line.rstrip())
+                if "AUTH_FAILED" in line or "Exiting due to fatal error" in line:
+                    proc.fatal = True
+        except Exception:
+            pass
+
+    threading.Thread(target=read_logs, daemon=True).start()
+    return proc
+
+
+def stop_vpn(proc):
+    if not proc or proc.poll() is not None:
+        return
+    try:
+        proc.send_signal(signal.SIGINT)
+        proc.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    except Exception:
+        pass
+    try:
+        proc.terminate()
+        proc.wait(timeout=3)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def vpn_ready(proc):
+    if proc.poll() is not None or getattr(proc, "fatal", False):
+        return False
+    route = vpn_route_active()
+    if route is None:
+        return any("Initialization Sequence Completed" in l for l in list(proc.log_tail))
+    if not route:
+        return False
+    return ip_ok(get_ip_info())
+
+
+def wait_for_vpn(proc, timeout=VPN_READY_TIMEOUT):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if proc.poll() is not None or getattr(proc, "fatal", False):
+            return False
+        if vpn_ready(proc):
+            return True
+        time.sleep(2)
+    return False
+
+
+def monitor_vpn(proc):
+    """Prints live IP/location and returns a reason string when the tunnel dies."""
+    failures = 0
+    while True:
+        time.sleep(LIVE_IP_INTERVAL)
+        if proc.poll() is not None:
+            return "OpenVPN process exited"
+        if getattr(proc, "fatal", False):
+            return "OpenVPN reported a fatal error"
+
+        route = vpn_route_active()
+        info = get_ip_info()
+        if route is False or not ip_ok(info):
+            failures += 1
+            print(f"[!] Connection check failed ({failures}/{MAX_POLL_FAILURES}).")
+            if failures >= MAX_POLL_FAILURES:
+                return "the proxy chain is unreachable"
+            continue
+
+        failures = 0
+        print(f"    Live IP     : {info['ip']}")
+        print(f"    Live Location: {info['city']}, {info['country']} ({info['org']})")
+
+
+def print_chain(chain):
+    for idx, (ptype, host, port) in enumerate(chain, 1):
+        print(f"    Hop {idx}: {ptype}://{host}:{port}")
+
+
+def print_banner():
+    red = "\033[1;31m"
+    reset = "\033[0m"
+    art = r""" _____ _   _ _   _  ____ ____  ____   _____  ____   __
+|_   _| | | | | | |/ ___|  _ \|  _ \ / _ \ \/ /\ \ / /
+  | | | |_| | | | | |  _| |_) | |_) | | | \  /  \ V /
+  | | |  _  | |_| | |_| |  __/|  _ <| |_| /  \   | |
+  |_| |_| |_|\___/ \____|_|   |_| \_\\___/_/\_\  |_|"""
+    print(red + art + reset)
+    print(red + "=" * 56 + reset)
+
+
+# --- Commands --------------------------------------------------------------
+
+def cmd_add(args):
+    """Adds proxies to proxy-pool.txt (deduplicated)."""
+    ensure_home()
+
+    existing_keys = set()
+    for entry in load_entries(PROXY_POOL_FILE):
+        existing_keys.add(proxy_key(entry))
+
+    added, skipped, bad = [], [], []
+    new_lines = []
+
+    for raw in args.proxies:
+        entry = parse_proxy_arg(raw, args.type)
+        if not entry:
+            bad.append(raw)
+            continue
+        key = proxy_key(entry)
+        if key in existing_keys:
+            skipped.append(key)
+            continue
+        existing_keys.add(key)
+        added.append(entry)
+        line = key
+        if entry[3] and entry[3] != "??":
+            line += f"  # {entry[3]}"
+        new_lines.append(line + "\n")
+
+    if new_lines:
+        with open(PROXY_POOL_FILE, "a") as f:
+            f.writelines(new_lines)
+
+    for key in added:
+        print(f"    [+] Added   {key}")
+    for key in skipped:
+        print(f"    [=] Already in pool: {key}")
+    for raw in bad:
+        print(f"    [!] Invalid proxy (skipped): {raw}")
+
+    if not added and not bad:
+        print("[=] Nothing new to add.")
+        return
+
+    if added and not args.no_test:
+        print(f"\n[*] Testing {len(added)} new proxy(es)...")
+        results = test_proxies(added, args.timeout)
+        for entry, latency in results:
+            if latency is None:
+                print(f"    [-] Unreachable  {fmt_proxy(entry)}")
+            else:
+                print(f"    [+] {latency:6.3f}s     {fmt_proxy(entry)}")
+
+    print(f"\n[*] Pool: {PROXY_POOL_FILE} ({len(existing_keys)} proxies)")
+
+
+def cmd_test(args):
+    """Tests every proxy in the pool and prints them fastest-first."""
+    pool = load_proxy_pool()
+    if not pool:
+        print("[!] Proxy pool is empty.")
+        print("    Add proxies with: thugproxy add socks5://host:port")
+        return
+
+    print(f"[*] Testing {len(pool)} proxies from {PROXY_POOL_FILE} ...")
+    results = test_proxies(pool, args.timeout)
+
+    working = sorted(
+        ((p, lat) for p, lat in results if lat is not None),
+        key=lambda x: x[1],
+    )
+    dead = [p for p, lat in results if lat is None]
+
+    for entry, latency in working:
+        print(f"    [+] {latency:6.3f}s  {fmt_proxy(entry)}")
+    for entry in dead:
+        print(f"    [-]     --   {fmt_proxy(entry)}")
+
+    print(
+        f"\n[*] {len(working)}/{len(pool)} reachable"
+        + (f", fastest {working[0][1]:.3f}s" if working else "")
+    )
+    if working:
+        print("[*] Run `thugproxy run` to connect through the fastest chain.")
+
+
+def cmd_list(args):
+    """Shows the proxy pool and the currently saved chain."""
+    pool = load_entries(PROXY_POOL_FILE)
+    print(f"[*] Proxy pool: {PROXY_POOL_FILE} ({len(pool)} proxies)")
+    for idx, entry in enumerate(pool, 1):
+        print(f"    [{idx:3d}] {fmt_proxy(entry)}")
+    if not pool:
+        print("    (empty - add some with `thugproxy add <proxy>`)")
+
+    chain = load_entries(PROXY_CHAIN_FILE)
+    print(f"\n[*] Saved chain: {PROXY_CHAIN_FILE} ({len(chain)} hops)")
+    for idx, entry in enumerate(chain, 1):
+        print(f"    Hop {idx}: {entry[0]}://{entry[1]}:{entry[2]}")
+    if not chain:
+        print("    (none yet - built automatically on first run)")
+
+
+def cmd_run():
+    """Validates/refreshes the proxy chain and connects OpenVPN through it."""
+    if os.geteuid() != 0:
+        print("[!] Please run with sudo: sudo thugproxy run")
+        sys.exit(1)
+
+    if not shutil.which("openvpn"):
+        print("[!] openvpn not found. Install it first (e.g. apt install openvpn).")
+        sys.exit(1)
+
+    ensure_auth_file()
+    ovpn_file = select_ovpn_file()
+
+    pool = load_proxy_pool()
+    chain = load_proxy_chain()
+
+    if chain:
+        print("[*] Validating the configured proxy chain...")
+        if chain_works(chain):
+            print("[+] Proxy chain is working.")
+        else:
+            print("[!] Configured chain is dead; searching for a replacement...")
+            dead_chain = chain
+            chain = None
+            while chain is None:
+                if not pool:
+                    print("[!] No proxy pool available; connecting directly...")
+                    chain = []
+                    break
+                chain = find_working_chain(pool, dead_chain)
+                if chain is None:
+                    print("[!] No working proxies right now; retrying in 30 seconds...")
+                    time.sleep(30)
+    elif pool:
+        print("[*] No chain configured; building one from the proxy pool...")
+        chain = None
+        while chain is None:
+            chain = find_working_chain(pool, [])
+            if chain is None:
+                print("[!] No working proxies right now; retrying in 30 seconds...")
+                time.sleep(30)
+
+    print("\n[*] Checking original connection...")
+    before = get_ip_info()
+    print(f"    Original IP : {before['ip']}")
+    print(f"    Location    : {before['city']}, {before['country']} ({before['org']})")
+
+    proc = None
+    try:
+        while True:
+            if chain:
+                print(f"\n[*] Starting OpenVPN through a {len(chain)}-hop proxy chain...")
+                print_chain(chain)
+                save_chain_file(chain)
+            else:
+                print(f"\n[*] Starting OpenVPN using {os.path.basename(ovpn_file)} (direct)...")
+
+            proc = start_vpn(ovpn_file, chain)
+            try:
+                if not wait_for_vpn(proc):
+                    print("[!] Could not establish the VPN tunnel.")
+                else:
+                    after = get_ip_info()
+                    print("\n" + "=" * 50)
+                    print("  VPN CONNECTED SUCCESSFULLY")
+                    print("=" * 50)
+                    print(f"  New VPN IP  : {after['ip']}")
+                    print(f"  Location    : {after['city']}, {after['country']}")
+                    print(f"  Provider    : {after['org']}")
+                    print("=" * 50)
+                    print("\n[*] VPN is active. Press Ctrl + C at any time to disconnect.\n")
+                    reason = monitor_vpn(proc)
+                    print(f"\n[!] VPN connection lost: {reason}.")
+            finally:
+                stop_vpn(proc)
+                proc = None
+
+            if not chain:
+                print("[*] Reconnecting in 5 seconds...")
+                time.sleep(5)
+                continue
+
+            if not pool:
+                print("[!] No proxy pool available for failover; retrying in 10 seconds...")
+                time.sleep(10)
+                continue
+
+            print("[*] Searching for a replacement proxy chain...")
+            dead_chain = chain
+            new_chain = None
+            while new_chain is None:
+                new_chain = find_working_chain(pool, dead_chain)
+                if new_chain is None:
+                    print("[!] No working proxies right now; retrying in 30 seconds...")
+                    time.sleep(30)
+            chain = new_chain
+    except KeyboardInterrupt:
+        print("\n\n[*] Shutting down VPN connection...")
+    finally:
+        stop_vpn(proc)
+        print("[*] VPN disconnected. Your normal connection is restored.")
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="thugproxy",
+        description="OpenVPN over a chain of fast, verified proxies.",
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"thugproxy {__version__}"
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    p_add = sub.add_parser("add", help="Add proxies to the pool (proxy-pool.txt)")
+    p_add.add_argument(
+        "proxies",
+        nargs="+",
+        metavar="PROXY",
+        help="host:port, type://host:port, or 'type host port'",
+    )
+    p_add.add_argument(
+        "--type",
+        default="socks5",
+        choices=PROXY_TYPES,
+        help="type for bare host:port entries (default: socks5)",
+    )
+    p_add.add_argument(
+        "--timeout",
+        type=float,
+        default=PROXY_TEST_TIMEOUT,
+        help="per-proxy test timeout in seconds",
+    )
+    p_add.add_argument(
+        "--no-test",
+        action="store_true",
+        help="skip reachability test after adding",
+    )
+
+    p_test = sub.add_parser("test", help="Test all proxies, fastest first")
+    p_test.add_argument(
+        "--timeout",
+        type=float,
+        default=PROXY_TEST_TIMEOUT,
+        help="per-proxy test timeout in seconds",
+    )
+
+    sub.add_parser("list", help="Show the proxy pool and saved chain")
+
+    sub.add_parser(
+        "run",
+        help="Build the fastest working chain and connect OpenVPN (default)",
+    )
+
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    print_banner()
+
+    command = args.command or "run"
+    if command == "add":
+        cmd_add(args)
+    elif command == "test":
+        cmd_test(args)
+    elif command == "list":
+        cmd_list(args)
+    else:
+        cmd_run()
+
+
+if __name__ == "__main__":
+    main()

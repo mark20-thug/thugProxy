@@ -1,0 +1,20 @@
+# thugproxy proxy pool
+# One proxy per line. Accepted formats:
+#
+#   socks5://1.2.3.4:1080
+#   socks4://1.2.3.4:1080
+#   http://1.2.3.4:8080
+#   socks5 1.2.3.4 1080
+#
+# Optional country annotation (helps build geographically diverse chains):
+#   socks5://1.2.3.4:1080  # US
+#
+# Lines starting with # are ignored. Prefer adding via CLI so duplicates
+# are skipped automatically:
+#
+#   ./thugproxy add socks5://1.2.3.4:1080
+#   ./thugproxy add 5.6.7.8:1080 --type socks4
+
+socks5://192.0.2.1:1080  # US
+http://192.0.2.2:8080    # DE
+socks4://192.0.2.3:1080  # SG
