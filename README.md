@@ -12,7 +12,7 @@ Open-source OpenVPN launcher that routes through a chain of **fast, verified pro
 
 1. **You add proxy servers** to your pool: `./thugproxy add socks5://1.2.3.4:1080`
 2. **It tests** every proxy in the pool and ranks them by reachability + latency: `./thugproxy test`
-3. **It builds a proxy chain** from the fastest working proxies (respecting country diversity, max 2 hops): fastest first
+3. **It starts** the VPN through the fastest verified proxy, then **enriches** the chain in the background with more reachable proxies (max 2 hops, respecting country diversity)
 4. **It connects** OpenVPN through the chain: `sudo ./thugproxy run`
 
 If the chain dies, it automatically searches for a replacement from the pool.
@@ -28,6 +28,16 @@ If the chain dies, it automatically searches for a replacement from the pool.
 - End-to-end chain validation via ProxyChains (`strict_chain`)
 - Auto-failover when the active chain goes down
 - Red ASCII-art banner, because naming things is hard
+
+## Installation
+
+```bash
+git clone <repository-url>
+cd thugproxy
+chmod +x thugproxy
+```
+
+Copy one or more `.ovpn` files into the script directory (or point `THUGPROXY_OVPN_DIR` at them).
 
 ## Requirements
 
