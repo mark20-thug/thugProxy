@@ -20,6 +20,9 @@ If the chain dies, it automatically searches for a replacement from the pool.
 ## Features
 
 - Auto-builds a multi-hop proxy chain from a pool of free proxies
+- Starts with the single fastest verified proxy, then enriches the chain
+  in the background by testing further reachable proxies until the chain
+  reaches the max hop count
 - Per-proxy health checks with measured latency (parallel, 20 workers)
 - Fast-first chain selection, with country diversity
 - End-to-end chain validation via ProxyChains (`strict_chain`)

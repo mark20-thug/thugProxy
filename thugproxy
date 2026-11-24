@@ -382,6 +382,43 @@ def chain_works(proxies):
         return False
 
 
+def find_fastest(pool, avoid=None):
+    """Returns the single fastest reachable proxy from the pool, or None."""
+    candidates = [p for p in pool if p[1] not in set(avoid or ())]
+    if not candidates:
+        return None
+    results = test_proxies(candidates)
+    working = [(p, lat) for p, lat in results if lat is not None]
+    if not working:
+        return None
+    working.sort(key=lambda x: x[1])
+    return working[0][0]
+
+
+def enrich_chain(pool, holder, stop_event):
+    """Background enrichment: grow the active chain with more reachable
+    proxies until MAX_CHAIN_HOPS is reached. No-op for direct connections."""
+    if not holder:
+        return
+    used_hosts = {h for _, h, _ in holder}
+    while not stop_event.is_set() and len(holder) < MAX_CHAIN_HOPS:
+        candidates = [p for p in pool if p[1] not in used_hosts]
+        if not candidates:
+            return
+        results = test_proxies(candidates)
+        working = sorted(
+            [(p, lat) for p, lat in results if lat is not None],
+            key=lambda x: x[1],
+        )
+        if not working:
+            return
+        found = working[0][0]
+        holder.append((found[0], found[1], found[2]))
+        used_hosts.add(found[1])
+        save_chain_file(holder)
+        print(f"[*] Background chain: adding {found[0]}://{found[1]}:{found[2]} ...")
+
+
 def find_working_chain(pool, dead_chain):
     """Keeps trying new proxy combinations until one passes validation."""
     avoid = {host for _, host, _ in dead_chain}
@@ -666,13 +703,15 @@ def cmd_run():
                     print("[!] No working proxies right now; retrying in 30 seconds...")
                     time.sleep(30)
     elif pool:
-        print("[*] No chain configured; building one from the proxy pool...")
-        chain = None
-        while chain is None:
-            chain = find_working_chain(pool, [])
-            if chain is None:
-                print("[!] No working proxies right now; retrying in 30 seconds...")
-                time.sleep(30)
+        print("[*] No chain configured; finding fastest proxies from the pool...")
+        first = find_fastest(pool)
+        if first is not None:
+            chain = [(first[0], first[1], first[2])]
+            print(f"[*] Starting OpenVPN with the fastest proxy: {fmt_proxy(first)}")
+        else:
+            chain = None
+            print("[!] No working proxies right now; retrying in 30 seconds...")
+            time.sleep(30)
 
     print("\n[*] Checking original connection...")
     before = get_ip_info()
@@ -680,6 +719,7 @@ def cmd_run():
     print(f"    Location    : {before['city']}, {before['country']} ({before['org']})")
 
     proc = None
+    enrich_stop = threading.Event()
     try:
         while True:
             if chain:
@@ -703,6 +743,11 @@ def cmd_run():
                     print(f"  Provider    : {after['org']}")
                     print("=" * 50)
                     print("\n[*] VPN is active. Press Ctrl + C at any time to disconnect.\n")
+                    threading.Thread(
+                        target=enrich_chain,
+                        args=(pool, chain, enrich_stop),
+                        daemon=True,
+                    ).start()
                     reason = monitor_vpn(proc)
                     print(f"\n[!] VPN connection lost: {reason}.")
             finally:
@@ -731,6 +776,7 @@ def cmd_run():
     except KeyboardInterrupt:
         print("\n\n[*] Shutting down VPN connection...")
     finally:
+        enrich_stop.set()
         stop_vpn(proc)
         print("[*] VPN disconnected. Your normal connection is restored.")
 
