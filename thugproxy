@@ -406,21 +406,17 @@ def enrich_chain(pool, holder, stop_event):
         print(f"[*] Background chain: adding {found[0]}://{found[1]}:{found[2]} ...")
 
 
-def find_working_chain(pool, dead_chain):
-    """Keeps trying new proxy combinations until one passes validation."""
-    avoid = {host for _, host, _ in dead_chain}
-    total_hosts = len({p[1] for p in pool})
-
-    while True:
-        candidate = pick_chain(pool, avoid=avoid)
-        if candidate is None:
-            return None
-        if chain_works(candidate):
-            return candidate
-        print("[!] Selected chain failed validation; trying other proxies...")
-        avoid |= {host for _, host, _ in candidate}
-        if len(avoid) >= total_hosts:
-            return None
+def find_working_proxy(pool, avoid=None):
+    """Returns a single reachable proxy from the pool, or None."""
+    candidates = [p for p in pool if p[1] not in set(avoid or ())]
+    if not candidates:
+        return None
+    results = test_proxies(candidates)
+    working = [(p, lat) for p, lat in results if lat is not None]
+    if not working:
+        return None
+    working.sort(key=lambda x: x[1])
+    return working[0][0]
 
 
 def start_vpn(ovpn_file, proxies):
@@ -673,9 +669,14 @@ def cmd_run():
     chain = load_proxy_chain()
 
     if pool:
-        first = pool[0]
-        chain = [(first[0], first[1], first[2])]
-        print(f"[*] Starting OpenVPN with first proxy: {fmt_proxy(first)}")
+        new_first = find_working_proxy(pool)
+        if new_first is not None:
+            chain = [(new_first[0], new_first[1], new_first[2])]
+            print(f"[*] Starting OpenVPN with first proxy: {fmt_proxy(new_first)}")
+        else:
+            chain = None
+            print("[!] No working proxies right now; retrying in 30 seconds...")
+            time.sleep(30)
     elif chain:
         print("[*] No proxy pool available; using saved proxy chain...")
         chain = list(chain)
@@ -733,13 +734,11 @@ def cmd_run():
 
             print("[*] Searching for a replacement proxy chain...")
             dead_chain = chain
-            new_chain = None
-            while new_chain is None:
-                new_chain = find_working_chain(pool, dead_chain)
-                if new_chain is None:
-                    print("[!] No working proxies right now; retrying in 30 seconds...")
-                    time.sleep(30)
-            chain = new_chain
+            new_first = find_working_proxy(pool, avoid={h for _, h, _ in dead_chain})
+            if new_first is None:
+                print("[!] No working proxies right now; retrying in 30 seconds...")
+                time.sleep(30)
+            chain = [(new_first[0], new_first[1], new_first[2])]
     except KeyboardInterrupt:
         print("\n\n[*] Shutting down VPN connection...")
     finally:
