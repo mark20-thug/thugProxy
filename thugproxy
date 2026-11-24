@@ -382,19 +382,6 @@ def chain_works(proxies):
         return False
 
 
-def find_fastest(pool, avoid=None):
-    """Returns the single fastest reachable proxy from the pool, or None."""
-    candidates = [p for p in pool if p[1] not in set(avoid or ())]
-    if not candidates:
-        return None
-    results = test_proxies(candidates)
-    working = [(p, lat) for p, lat in results if lat is not None]
-    if not working:
-        return None
-    working.sort(key=lambda x: x[1])
-    return working[0][0]
-
-
 def enrich_chain(pool, holder, stop_event):
     """Background enrichment: grow the active chain with more reachable
     proxies until MAX_CHAIN_HOPS is reached. No-op for direct connections."""
@@ -686,15 +673,9 @@ def cmd_run():
     chain = load_proxy_chain()
 
     if pool:
-        print("[*] No chain configured; finding fastest proxies from the pool...")
-        first = find_fastest(pool)
-        if first is not None:
-            chain = [(first[0], first[1], first[2])]
-            print(f"[*] Starting OpenVPN with the fastest proxy: {fmt_proxy(first)}")
-        else:
-            chain = None
-            print("[!] No working proxies right now; retrying in 30 seconds...")
-            time.sleep(30)
+        first = pool[0]
+        chain = [(first[0], first[1], first[2])]
+        print(f"[*] Starting OpenVPN with first proxy: {fmt_proxy(first)}")
     elif chain:
         print("[*] No proxy pool available; using saved proxy chain...")
         chain = list(chain)
