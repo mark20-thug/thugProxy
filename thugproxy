@@ -670,7 +670,7 @@ def cmd_list(args):
 
 
 def cmd_run():
-    """Validates/refreshes the proxy chain and connects OpenVPN through it."""
+    """Connects OpenVPN through the proxy chain, enriching it in the background."""
     if os.geteuid() != 0:
         print("[!] Please run with sudo: sudo thugproxy run")
         sys.exit(1)
@@ -685,24 +685,7 @@ def cmd_run():
     pool = load_proxy_pool()
     chain = load_proxy_chain()
 
-    if chain:
-        print("[*] Validating the configured proxy chain...")
-        if chain_works(chain):
-            print("[+] Proxy chain is working.")
-        else:
-            print("[!] Configured chain is dead; searching for a replacement...")
-            dead_chain = chain
-            chain = None
-            while chain is None:
-                if not pool:
-                    print("[!] No proxy pool available; connecting directly...")
-                    chain = []
-                    break
-                chain = find_working_chain(pool, dead_chain)
-                if chain is None:
-                    print("[!] No working proxies right now; retrying in 30 seconds...")
-                    time.sleep(30)
-    elif pool:
+    if pool:
         print("[*] No chain configured; finding fastest proxies from the pool...")
         first = find_fastest(pool)
         if first is not None:
@@ -712,6 +695,9 @@ def cmd_run():
             chain = None
             print("[!] No working proxies right now; retrying in 30 seconds...")
             time.sleep(30)
+    elif chain:
+        print("[*] No proxy pool available; using saved proxy chain...")
+        chain = list(chain)
 
     print("\n[*] Checking original connection...")
     before = get_ip_info()
