@@ -53,6 +53,9 @@ MAX_POLL_FAILURES = 3
 # Timeout for validating a whole proxy chain through ProxyChains
 CHAIN_TEST_TIMEOUT = 30
 
+# Maximum number of proxies probed when hunting for the first working hop
+FIRST_HOP_PROBE_LIMIT = 20
+
 PROXY_TYPES = ("socks4", "socks5", "http", "https")
 
 
@@ -406,9 +409,11 @@ def enrich_chain(pool, holder, stop_event):
         print(f"[*] Background chain: adding {found[0]}://{found[1]}:{found[2]} ...")
 
 
-def find_working_proxy(pool, avoid=None):
+def find_working_proxy(pool, avoid=None, limit=None):
     """Returns a single reachable proxy from the pool, or None."""
     candidates = [p for p in pool if p[1] not in set(avoid or ())]
+    if limit is not None:
+        candidates = candidates[:limit]
     if not candidates:
         return None
     results = test_proxies(candidates)
@@ -669,7 +674,7 @@ def cmd_run():
     chain = load_proxy_chain()
 
     if pool:
-        new_first = find_working_proxy(pool)
+        new_first = find_working_proxy(pool, limit=FIRST_HOP_PROBE_LIMIT)
         if new_first is not None:
             chain = [(new_first[0], new_first[1], new_first[2])]
             print(f"[*] Starting OpenVPN with first proxy: {fmt_proxy(new_first)}")
@@ -734,7 +739,7 @@ def cmd_run():
 
             print("[*] Searching for a replacement proxy chain...")
             dead_chain = chain
-            new_first = find_working_proxy(pool, avoid={h for _, h, _ in dead_chain})
+            new_first = find_working_proxy(pool, avoid={h for _, h, _ in dead_chain}, limit=FIRST_HOP_PROBE_LIMIT)
             if new_first is None:
                 print("[!] No working proxies right now; retrying in 30 seconds...")
                 time.sleep(30)
